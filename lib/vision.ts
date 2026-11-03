@@ -2,6 +2,12 @@ import sharp from "sharp";
 import { regionForZip } from "./plants";
 import type { VisionDetection } from "./types";
 
+const DEFAULT_GEMINI_VISION_MODEL = "gemini-2.5-flash";
+
+function geminiVisionModel() {
+  return process.env.GEMINI_VISION_MODEL || DEFAULT_GEMINI_VISION_MODEL;
+}
+
 type GeminiResponse = {
   candidates?: Array<{
     content?: {
@@ -84,21 +90,23 @@ async function discoverPlantsWithGemini(
 
   const [, mimeType, base64] = match;
   const region = regionForZip(rawZip);
-  const model = process.env.GEMINI_VISION_MODEL || "gemini-2.5-flash";
+  const model = geminiVisionModel();
   const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
   const prompt = `You are a careful field botanist and ecological landscape auditor working in New Jersey.
 
 Analyze this residential yard photo for a homeowner in ${region.city}, ${region.state || "New Jersey"}${region.county ? `, ${region.county} County` : ""} (USDA zone ${region.zone}; ${region.province ?? region.ecoregion}; ${region.ecoregionCode}).
 
-Identify up to 10 distinct plants that are visibly present: trees, shrubs, flowering perennials, vines, groundcovers, and ornamental grasses. Do not identify lawn grass unless it is a distinct ornamental clump. Do not identify fences, furniture, mulch, sky, or people as plants.
+Locate and identify up to 10 distinct plant instances that are visibly present. A plant instance means one separately rooted individual or one visually isolated ornamental clump. If several stems belong to the same rooted shrub, hedge, or perennial clump, return one box for that whole instance instead of multiple boxes. Do not merge two distinct neighboring plants, trunks, clumps, or separated crown portions into one box. Trees count as one instance even when their foliage touches neighboring plants. Flowering perennials, vines, groundcovers, ornamental grasses, shrubs, and trees are valid.
+
+Treat this as both instance detection and botanical identification. First locate each individual visually, then identify it. Prefer a separate accurate box over including unrelated objects, lawn, mulch, fence, furniture, sky, or people. Do not identify lawn grass unless it is a distinct ornamental clump. Never place one box around a mixed group.
 
 For each plant, return:
 - isPlant: true only if you can see an actual plant
 - scientificName: the most likely binomial, or genus + "spp." if uncertain
 - commonName: a plain-English name
 - confidence: a number from 0 to 1
-- x, y, width, height: normalized bounding-box coordinates from 0 to 1, relative to the FULL original image, origin top-left. The box must tightly enclose the visible foliage of that plant and stay inside the image.
+- x, y, width, height: normalized bounding-box coordinates from 0 to 1, relative to the FULL original image, origin top-left. Return x as the left edge and y as the top edge, with width and height extending right and down. Each box must tightly enclose that plant instance's visible foliage, with x + width <= 1 and y + height <= 1. Include stems only when they help define the instance. Return no box if the instance cannot be isolated visually.
 - plantPart: "canopy", "shrub", "perennial", "groundcover", "vine", or "grass"
 - note: one short visual clue (leaf shape, flower color, growth habit)
 - topMatches: if confidence is below 0.75, list up to 2 alternative local plants with scientificName, commonName, and confidence
@@ -170,7 +178,7 @@ async function identifyCropWithGemini(dataUrl: string, rawZip: string): Promise<
 
   const [, mimeType, base64] = match;
   const region = regionForZip(rawZip);
-  const model = process.env.GEMINI_VISION_MODEL || "gemini-2.5-flash";
+  const model = geminiVisionModel();
   const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
   const prompt = `Identify the single plant in this cropped yard photo. Region: ${region.city}, New Jersey. Return only JSON: {"scientificName":"Genus species","commonName":"Common name","confidence":0.85,"plantPart":"shrub","note":"one visual clue"}. If no plant is visible, return {"scientificName":""}.`;
 
@@ -271,14 +279,16 @@ function toVisionDetection(value: unknown): VisionDetection | null {
   const scientificName = String(record.scientificName ?? "").trim();
   if (!scientificName) return null;
 
+  const x = normalizeCoordinate(record.x);
+  const y = normalizeCoordinate(record.y);
   return {
     scientificName,
     commonName: record.commonName ? String(record.commonName) : undefined,
     confidence: clamp(Number(record.confidence ?? 0.7), 0, 1),
-    x: normalizeCoordinate(record.x),
-    y: normalizeCoordinate(record.y),
-    width: normalizeCoordinate(record.width),
-    height: normalizeCoordinate(record.height),
+    x,
+    y,
+    width: Math.min(normalizeCoordinate(record.width), 1 - x),
+    height: Math.min(normalizeCoordinate(record.height), 1 - y),
     note: record.note ? String(record.note).slice(0, 180) : undefined,
     isPlant: record.isPlant === false ? false : undefined,
     plantPart: record.plantPart ? String(record.plantPart).slice(0, 40) : undefined,
