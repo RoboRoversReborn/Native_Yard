@@ -1,3 +1,4 @@
+import sharp from "sharp";
 import { regionForZip } from "./plants";
 import type { VisionDetection } from "./types";
 
@@ -13,6 +14,63 @@ type GeminiResponse = {
 };
 
 export async function identifyPlantsWithGemini(
+  dataUrl: string,
+  rawZip: string,
+): Promise<VisionDetection[]> {
+  if (!process.env.GEMINI_API_KEY) {
+    return identifyPlantsWithPlantNet(dataUrl);
+  }
+
+  let discovered: VisionDetection[];
+  try {
+    discovered = await discoverPlantsWithGemini(dataUrl, rawZip);
+  } catch (error) {
+    if (!process.env.PLANTNET_API_KEY) throw error;
+    return identifyPlantsWithPlantNet(dataUrl);
+  }
+
+  if (!discovered.length) {
+    return process.env.PLANTNET_API_KEY ? identifyPlantsWithPlantNet(dataUrl) : [];
+  }
+
+  const verified = await Promise.all(
+    discovered.map(async (plant) => {
+      try {
+        const crop = await cropImage(dataUrl, plant);
+        const identified = await identifyCropWithGemini(crop, rawZip);
+        if (identified?.scientificName) {
+          return {
+            ...plant,
+            scientificName: identified.scientificName,
+            commonName: identified.commonName,
+            confidence: Math.max(plant.confidence, identified.confidence),
+            note: identified.note ?? plant.note,
+            plantPart: identified.plantPart ?? plant.plantPart,
+            topMatches: identified.topMatches ?? plant.topMatches,
+          };
+        }
+      } catch (error) {
+        console.error("NativeYard crop identification failed:", error instanceof Error ? error.message : error);
+      }
+
+      if (process.env.PLANTNET_API_KEY) {
+        try {
+          const crop = await cropImage(dataUrl, plant);
+          const fallback = await identifyImageWithPlantNet(crop);
+          if (fallback) return { ...plant, ...fallback };
+        } catch (error) {
+          console.error("NativeYard PlantNet crop fallback failed:", error instanceof Error ? error.message : error);
+        }
+      }
+
+      return plant;
+    }),
+  );
+
+  return verified.filter((plant) => plant.isPlant !== false).slice(0, 10);
+}
+
+async function discoverPlantsWithGemini(
   dataUrl: string,
   rawZip: string,
 ): Promise<VisionDetection[]> {
@@ -101,6 +159,103 @@ Be conservative. If a plant is too blurry or generic to identify, omit it rather
     .map((item) => toVisionDetection(item))
     .filter((item): item is VisionDetection => Boolean(item))
     .slice(0, 10);
+}
+
+async function identifyCropWithGemini(dataUrl: string, rawZip: string): Promise<VisionDetection | null> {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return null;
+
+  const match = /^data:(image\/[^;]+);base64,(.+)$/.exec(dataUrl);
+  if (!match) return null;
+
+  const [, mimeType, base64] = match;
+  const region = regionForZip(rawZip);
+  const model = process.env.GEMINI_VISION_MODEL || "gemini-2.5-flash";
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+  const prompt = `Identify the single plant in this cropped yard photo. Region: ${region.city}, New Jersey. Return only JSON: {"scientificName":"Genus species","commonName":"Common name","confidence":0.85,"plantPart":"shrub","note":"one visual clue"}. If no plant is visible, return {"scientificName":""}.`;
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [{ role: "user", parts: [{ text: prompt }, { inlineData: { mimeType, data: base64 } }] }],
+      generationConfig: { temperature: 0.1, responseMimeType: "application/json" },
+    }),
+  });
+  const payload = (await response.json()) as GeminiResponse;
+  if (!response.ok) throw new Error(payload.error?.message || "Gemini crop identification failed.");
+
+  const text = payload.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("").trim() ?? "";
+  if (!text) throw new Error("Gemini returned an empty crop response.");
+
+  const parsed = JSON.parse(stripCodeFence(text)) as Record<string, unknown>;
+  if (!String(parsed.scientificName ?? "").trim()) return null;
+  return {
+    ...toVisionDetection({ ...parsed, x: 0, y: 0, width: 1, height: 1 }),
+  } as VisionDetection;
+}
+
+async function cropImage(dataUrl: string, plant: VisionDetection): Promise<string> {
+  const match = /^data:image\/[^;]+;base64,(.+)$/.exec(dataUrl);
+  if (!match) throw new Error("The image must be a base64 image URL.");
+
+  const image = sharp(Buffer.from(match[1], "base64")).rotate();
+  const metadata = await image.metadata();
+  const width = metadata.width ?? 0;
+  const height = metadata.height ?? 0;
+  if (!width || !height) throw new Error("Could not read uploaded image dimensions.");
+
+  const paddedX = clamp(plant.x - plant.width * 0.08, 0, 1);
+  const paddedY = clamp(plant.y - plant.height * 0.08, 0, 1);
+  const paddedRight = clamp(plant.x + plant.width * 1.08, 0, 1);
+  const paddedBottom = clamp(plant.y + plant.height * 1.08, 0, 1);
+  const left = Math.floor(paddedX * width);
+  const top = Math.floor(paddedY * height);
+  const cropWidth = Math.max(1, Math.ceil((paddedRight - paddedX) * width));
+  const cropHeight = Math.max(1, Math.ceil((paddedBottom - paddedY) * height));
+  const cropped = await image.extract({
+    left,
+    top,
+    width: Math.min(cropWidth, width - left),
+    height: Math.min(cropHeight, height - top),
+  }).jpeg({ quality: 90 }).toBuffer();
+
+  return `data:image/jpeg;base64,${cropped.toString("base64")}`;
+}
+
+async function identifyPlantsWithPlantNet(dataUrl: string): Promise<VisionDetection[]> {
+  const match = await identifyImageWithPlantNet(dataUrl);
+  return match ? [{ ...match, x: 0, y: 0, width: 1, height: 1 }] : [];
+}
+
+async function identifyImageWithPlantNet(dataUrl: string): Promise<Pick<VisionDetection, "scientificName" | "commonName" | "confidence"> | null> {
+  const apiKey = process.env.PLANTNET_API_KEY;
+  if (!apiKey) return null;
+  const match = /^data:image\/([^;]+);base64,(.+)$/.exec(dataUrl);
+  if (!match) throw new Error("PlantNet requires a base64 image.");
+
+  const bytes = Buffer.from(match[2], "base64");
+  const form = new FormData();
+  form.append("images", new Blob([bytes], { type: `image/${match[1]}` }), "plant.jpg");
+
+  const response = await fetch(`https://my-api.plantnet.org/v2/identify/all?api-key=${encodeURIComponent(apiKey)}`, {
+    method: "POST",
+    body: form,
+  });
+  const payload = await response.json() as {
+    results?: Array<{ score?: number; species?: { scientificNameWithoutAuthor?: string; scientificName?: string; commonNames?: string[] } }>;
+    message?: string;
+  };
+  if (!response.ok) throw new Error(payload.message || "PlantNet identification failed.");
+
+  const top = payload.results?.[0];
+  const scientificName = String(top?.species?.scientificNameWithoutAuthor ?? top?.species?.scientificName ?? "").trim();
+  if (!scientificName) return null;
+  return {
+    scientificName,
+    commonName: top?.species?.commonNames?.[0] || undefined,
+    confidence: clamp(Number(top?.score ?? 0), 0, 1),
+  };
 }
 
 function stripCodeFence(value: string) {

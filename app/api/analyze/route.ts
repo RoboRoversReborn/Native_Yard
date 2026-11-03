@@ -61,9 +61,9 @@ export async function POST(request: Request) {
     );
   }
 
-  if (!process.env.GEMINI_API_KEY) {
+  if (!process.env.GEMINI_API_KEY && !process.env.PLANTNET_API_KEY) {
     return fail(
-      "Live plant identification is not configured on this deployment. Add GEMINI_API_KEY to enable photo analysis, or try the sample yard.",
+      "Live plant identification is not configured on this deployment. Add GEMINI_API_KEY or PLANTNET_API_KEY to enable photo analysis, or try the sample yard.",
       "vision_unavailable",
       503,
     );

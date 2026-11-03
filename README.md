@@ -64,6 +64,14 @@ Without a key, photo uploads return a clear `503 vision_unavailable` message and
 4. Maps returned scientific names to the local NJ snapshot and builds an audit.
 5. Returns actionable 4xx/5xx errors instead of falling back to sample data.
 
+Optional PlantNet fallback for staged crop identification or a PlantNet-only deployment:
+
+```bash
+PLANTNET_API_KEY=your-key
+```
+
+The analysis flow first asks Gemini to find all plants and return normalized boxes. Gemini then identifies each cropped box individually. If Gemini cannot identify a crop, that crop is sent to PlantNet when `PLANTNET_API_KEY` is configured. If no Gemini key is configured, PlantNet identifies the full image directly.
+
 Optional model override:
 
 ```bash
