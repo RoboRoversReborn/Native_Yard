@@ -30,6 +30,11 @@ export async function identifyPlantsWithGemini(
   let discovered: VisionDetection[];
   try {
     discovered = await discoverPlantsWithGemini(dataUrl, rawZip);
+    console.info("NativeYard Gemini discovery:", {
+      model: geminiVisionModel(),
+      sentFullImage: true,
+      plants: discovered.length,
+    });
   } catch (error) {
     if (!process.env.PLANTNET_API_KEY) throw error;
     return identifyPlantsWithPlantNet(dataUrl);

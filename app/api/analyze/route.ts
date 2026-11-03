@@ -76,6 +76,11 @@ export async function POST(request: Request) {
 
   try {
     const vision = await identifyPlantsWithGemini(String(body.image), zip);
+    console.info("NativeYard vision detections:", {
+      model: process.env.GEMINI_VISION_MODEL || "gemini-2.5-flash",
+      count: vision.length,
+      scientificNames: vision.map((item) => item.scientificName),
+    });
     const audit = buildAuditFromVision(vision, zip, {
       image: meta ?? { width: check.width, height: check.height },
     });
@@ -85,7 +90,9 @@ export async function POST(request: Request) {
     }
 
     return fail(
-      "We could not confidently identify any New Jersey plants in that photo. Try a wider, brighter shot that includes leaves and stems, or move closer to the bed.",
+      vision.length
+        ? "Gemini found plants, but none matched the local New Jersey plant catalog. Try a clearer shot with foliage and stems, or add the detected species to the catalog."
+        : "We could not identify any plants in that photo. Try a wider, brighter shot that includes clear leaves and stems, or move closer to the bed.",
       "no_detections",
       422,
     );
